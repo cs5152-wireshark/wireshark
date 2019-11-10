@@ -101,6 +101,8 @@ struct ssh_flow_data {
     gchar*  kex;
     gchar* key0;
     gchar* key1;
+    guint key0_len;
+    guint key1_len;
     int   (*kex_specific_dissector)(guint8 msg_code, tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree);
 
     /* [0] is client's, [1] is server's */
@@ -360,8 +362,25 @@ static void ssh_set_kex_specific_dissector(struct ssh_flow_data *global_data);
 
 enum { MAXL = 40, MAXC = 260 };
 
+static void parse_ssh_key(const gchar* val_0, guchar** arr, guint* len_) {
+    gsize len = strlen(val_0);
+    gsize byte_len = len / 2;
+    guchar* bytes = (guchar*) wmem_alloc0(wmem_file_scope(), byte_len * sizeof(guchar));
+    guint x;
+    for (x = 0; x < len; x += 2) {
+       gchar* vl = g_strdup_printf("%c%c", val_0[x], val_0[x + 1]);
+       gulong val = strtoul(vl, NULL, 16);
+       guchar byte_val = (guchar) val;
+       bytes[x / 2] = byte_val;
+       g_free(vl);
+    }
+
+    *arr = bytes;
+    *len_ = byte_len;
+}
+
 static void
-parse_ssh_file(const gchar *file_path, gchar **key0, gchar **key1) {
+parse_ssh_file(const gchar *file_path, guchar **key0, guint *len0, guchar **key1, guint *len1) {
     GError *error = NULL;
     gsize *len = NULL;
     gchar *content;
@@ -375,7 +394,6 @@ parse_ssh_file(const gchar *file_path, gchar **key0, gchar **key1) {
    
     gchar** file = g_strsplit(content, "\n", 30000);
     guint length = g_strv_length(file);
-    gchar**** words = (gchar****) g_malloc(sizeof(gchar***) * length);
     
     const gchar* val_0 = NULL;
     const gchar* val_1 = NULL;
@@ -386,13 +404,12 @@ parse_ssh_file(const gchar *file_path, gchar **key0, gchar **key1) {
 
         guint line_length = g_strv_length(vals);
 
-        if (line_length <= 1) {
-            words[i] = NULL;
-            continue;
-        }
-
         const gchar* key0_iden = "KEY_DUMP_0";
         const gchar* key1_iden = "KEY_DUMP_1";
+
+        if (line_length < 2) {
+            continue;
+        }
      
         if (strcmp(vals[1], "WSDUMP") == 0) {
             guint j = 2;
@@ -408,13 +425,8 @@ parse_ssh_file(const gchar *file_path, gchar **key0, gchar **key1) {
         }
     }
 
-    // STEP 3: Get the keys
-    *key0 = g_strdup(val_0);
-    *key1 = g_strdup(val_1);
-   
-    // TODO Search by these...
-
-    
+    parse_ssh_key(val_0, key0, len0);
+    parse_ssh_key(val_1, key1, len1);
 }
 
 static int
@@ -436,23 +448,31 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
     // TODO Retrieve file path after parsing is fixed.
     // Fixed path for now.
     const gchar* file_path = "/home/evan/openssh-dump/special_dump.txt"; //getenv("WS_SSH_DECRYPTION_FILE");
-    gchar* key0 = NULL;
-    gchar* key1 = NULL;
+    guchar* key0 = NULL;
+    guchar* key1 = NULL;
+    guint len0 = 0;
+    guint len1 = 0;
 
     if (file_path != NULL) {
-        parse_ssh_file(file_path, &key0, &key1);
+        parse_ssh_file(file_path, &key0, &len0, &key1, &len1);
     }
     conversation = find_or_create_conversation(pinfo);
 
     global_data = (struct ssh_flow_data *)conversation_get_proto_data(conversation, proto_ssh);
+    
     if (!global_data) {
         global_data = (struct ssh_flow_data *)wmem_alloc0(wmem_file_scope(), sizeof(struct ssh_flow_data));
         global_data->version=SSH_VERSION_UNKNOWN;
         global_data->kex_specific_dissector=ssh_dissect_kex_dh;
         global_data->key0 = key0;
         global_data->key1 = key1;
+        global_data->key0_len = len0;
+        global_data->key1_len = len1;
         global_data->peer_data[CLIENT_PEER_DATA].mac_length=-1;
         global_data->peer_data[SERVER_PEER_DATA].mac_length=-1;
+
+        g_print("key0 found: %u with len\n", len0);
+        g_print("key1 found: %u with len\n", len1);
 
         conversation_add_proto_data(conversation, proto_ssh, global_data);
     }
