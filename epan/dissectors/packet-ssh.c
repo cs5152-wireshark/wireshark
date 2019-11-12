@@ -45,6 +45,7 @@
 #include <epan/prefs.h>
 #include <epan/expert.h>
 #include <wsutil/strtoi.h>
+#include <wsutil/wsgcrypt.h>
 
 #include "packet-tcp.h"
 
@@ -103,6 +104,7 @@ struct ssh_flow_data {
     gchar* key1;
     guint key0_len;
     guint key1_len;
+    guint64 current_seqnr;
     int   (*kex_specific_dissector)(guint8 msg_code, tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree);
 
     /* [0] is client's, [1] is server's */
@@ -265,6 +267,44 @@ static dissector_handle_t ssh_handle;
 #define SSH_MSG_CHANNEL_SUCCESS             99
 #define SSH_MSG_CHANNEL_FAILURE             100
 
+#define POKE_U64(p, v) \
+	do { \
+		const u_int64_t __v = (v); \
+		((u_char *)(p))[0] = (__v >> 56) & 0xff; \
+		((u_char *)(p))[1] = (__v >> 48) & 0xff; \
+		((u_char *)(p))[2] = (__v >> 40) & 0xff; \
+		((u_char *)(p))[3] = (__v >> 32) & 0xff; \
+		((u_char *)(p))[4] = (__v >> 24) & 0xff; \
+		((u_char *)(p))[5] = (__v >> 16) & 0xff; \
+		((u_char *)(p))[6] = (__v >> 8) & 0xff; \
+		((u_char *)(p))[7] = __v & 0xff; \
+	} while (0)
+	
+#define PEEK_U64(p) \
+	(((u_int64_t)(((const u_char *)(p))[0]) << 56) | \
+	 ((u_int64_t)(((const u_char *)(p))[1]) << 48) | \
+	 ((u_int64_t)(((const u_char *)(p))[2]) << 40) | \
+	 ((u_int64_t)(((const u_char *)(p))[3]) << 32) | \
+	 ((u_int64_t)(((const u_char *)(p))[4]) << 24) | \
+	 ((u_int64_t)(((const u_char *)(p))[5]) << 16) | \
+	 ((u_int64_t)(((const u_char *)(p))[6]) << 8) | \
+	  (u_int64_t)(((const u_char *)(p))[7]))
+
+#define PEEK_U32(p) \
+	(((u_int32_t)(((const u_char *)(p))[0]) << 24) | \
+	 ((u_int32_t)(((const u_char *)(p))[1]) << 16) | \
+	 ((u_int32_t)(((const u_char *)(p))[2]) << 8) | \
+	  (u_int32_t)(((const u_char *)(p))[3]))
+
+#define POKE_U32(p, v) \
+	do { \
+		const u_int32_t __v = (v); \
+		((u_char *)(p))[0] = (__v >> 24) & 0xff; \
+		((u_char *)(p))[1] = (__v >> 16) & 0xff; \
+		((u_char *)(p))[2] = (__v >> 8) & 0xff; \
+		((u_char *)(p))[3] = __v & 0xff; \
+	} while (0)
+
 /* 128-191 reserved for client protocols */
 /* 192-255 local extensions */
 
@@ -353,7 +393,7 @@ static int ssh_dissect_protocol(tvbuff_t *tvb, packet_info *pinfo,
         struct ssh_flow_data *global_data,
         int offset, proto_tree *tree, int is_response, guint *version,
         gboolean *need_desegmentation);
-static int ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
+static int ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo, struct ssh_flow_data *global_data,
         struct ssh_peer_data *peer_data,
         int offset, proto_tree *tree);
 static void ssh_choose_algo(gchar *client, gchar *server, gchar **result);
@@ -362,17 +402,87 @@ static void ssh_set_kex_specific_dissector(struct ssh_flow_data *global_data);
 
 enum { MAXL = 40, MAXC = 260 };
 
+
+gcry_error_t
+openssh_chacha20_poly1305_decrypt_len(const guchar *key, guint64 pkt_seq_number, const guchar *encrypted_pkt, guint32 *payload_len) {
+    // cipher1 decrypts packet length header, cipher2 decrypts packet payload
+	gcry_cipher_hd_t cipher1;
+    gcry_error_t err = 0;
+
+	// split the 512-bit key into two 256-bit keys (K1 and K2)
+	guchar k1[32];
+	guchar k2[32];
+	memcpy(k1, (key + 32), 32);
+	memcpy(k2, key, 32);
+	
+	// convert the sequence number from 64-bit unsigned int to 64-bit big endian byte array
+	guchar seqbuf[8];
+    g_print("sequence number: %i\n", (int) pkt_seq_number);
+    	POKE_U64(seqbuf, pkt_seq_number);
+	
+	// set up variables for reading packet payload length
+	guchar lenbuf[4];
+
+	// decrypt packet payload length and convert it from 32-bit big endian byte array to 32-bit unsigned int
+	err = gcry_cipher_open (&cipher1, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_STREAM, 0);
+	err = gcry_cipher_setkey(cipher1, k1, 32);
+	err = gcry_cipher_setiv(cipher1, seqbuf, 8);
+	err = gcry_cipher_decrypt(cipher1, lenbuf, 4, encrypted_pkt, 4);
+
+    
+    guint32 actlen =  PEEK_U32(lenbuf);
+    g_print("Found internal length %u\n", actlen);
+	*payload_len = actlen;
+    return err;
+}
+
+gcry_error_t
+openssh_chacha20_poly1305_decrypt(const guchar *key, guint64 pkt_seq_number, const guchar *encrypted_pkt, guint payload_len, guchar *outbuf) {
+	// cipher1 decrypts packet length header, cipher2 decrypts packet payload
+	gcry_cipher_hd_t cipher2;
+    gcry_error_t err = 0;
+
+    guchar k1[32];
+	guchar k2[32];
+	memcpy(k1, (key + 32), 32);
+	memcpy(k2, key, 32);
+	
+    guchar seqbuf[8];
+	POKE_U64(seqbuf, pkt_seq_number);
+	
+	//set initial block count to 1
+	const guchar ctrbuf[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
+	guchar ctrseqbuf[16];
+	memcpy(ctrseqbuf, ctrbuf, 8);
+	memcpy(ctrseqbuf + 8, seqbuf, 8);
+	
+	// decrypt packet payload and store the output in out
+	err = gcry_cipher_open (&cipher2, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_STREAM, 0);
+	err = gcry_cipher_setkey(cipher2, k2, 32);
+	err = gcry_cipher_setiv(cipher2, ctrseqbuf, 16); // pass in both the initial block counter and initialization vector
+	err = gcry_cipher_decrypt(cipher2, outbuf, payload_len, encrypted_pkt, payload_len);
+
+	/* TODO: Verify the MAC tag before we decrypt the packet payload
+	err = gcry_cipher_open (&cipher2, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_POLY1305, 0);
+	err = gcry_cipher_setkey(cipher2, k2, 32);
+	err = gcry_cipher_setiv(cipher2, seqbuf, 8);
+	err = gcry_cipher_checktag(cipher2, tagbuf, 16);
+	err = gcry_cipher_decrypt(cipher2, lenbuf, 4, encrypted_pkt, 4);
+	*/
+	
+	return err;
+}
+
 static void parse_ssh_key(const gchar* val_0, guchar** arr, guint* len_) {
     gsize len = strlen(val_0);
     gsize byte_len = len / 2;
     guchar* bytes = (guchar*) wmem_alloc0(wmem_file_scope(), byte_len * sizeof(guchar));
     guint x;
+    guint b = 0;
     for (x = 0; x < len; x += 2) {
-       gchar* vl = g_strdup_printf("%c%c", val_0[x], val_0[x + 1]);
-       gulong val = strtoul(vl, NULL, 16);
-       guchar byte_val = (guchar) val;
-       bytes[x / 2] = byte_val;
-       g_free(vl);
+       gchar buf[3] = {val_0[x], val_0[x+1], 0};
+       bytes[b] = strtoul(buf, NULL, 16);
+       b++;
     }
 
     *arr = bytes;
@@ -444,7 +554,6 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
     struct ssh_flow_data *global_data=NULL;
     struct ssh_peer_data *peer_data;
 
-
     // TODO Retrieve file path after parsing is fixed.
     // Fixed path for now.
     const gchar* file_path = "/home/evan/openssh-dump/special_dump.txt"; //getenv("WS_SSH_DECRYPTION_FILE");
@@ -462,6 +571,7 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
     
     if (!global_data) {
         global_data = (struct ssh_flow_data *)wmem_alloc0(wmem_file_scope(), sizeof(struct ssh_flow_data));
+        global_data->current_seqnr = 0;
         global_data->version=SSH_VERSION_UNKNOWN;
         global_data->kex_specific_dissector=ssh_dissect_kex_dh;
         global_data->key0 = key0;
@@ -475,6 +585,9 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
         g_print("key1 found: %u with len\n", len1);
 
         conversation_add_proto_data(conversation, proto_ssh, global_data);
+    } else {
+        // TODO: Where should this go?
+        global_data->current_seqnr = global_data->current_seqnr + 1;
     }
 
     peer_data = &global_data->peer_data[is_response];
@@ -528,7 +641,7 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
             switch(version) {
 
             case SSH_VERSION_UNKNOWN:
-                offset = ssh_dissect_encrypted_packet(tvb, pinfo,
+                offset = ssh_dissect_encrypted_packet(tvb, pinfo, global_data,
                         &global_data->peer_data[is_response], offset, ssh_tree);
                 break;
 
@@ -601,7 +714,7 @@ ssh_dissect_ssh2(tvbuff_t *tvb, packet_info *pinfo,
             offset, ssh2_tree, is_response,
             need_desegmentation);
     } else {
-        offset = ssh_dissect_encrypted_packet(tvb, pinfo,
+        offset = ssh_dissect_encrypted_packet(tvb, pinfo, global_data,
                 &global_data->peer_data[is_response], offset, ssh2_tree);
     }
 
@@ -1032,8 +1145,10 @@ ssh_dissect_kex_ecdh(guint8 msg_code, tvbuff_t *tvb,
     return offset;
 }
 
+// tvb_get_string_bytes
+
 static int
-ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
+ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo, struct ssh_flow_data *global_data,
         struct ssh_peer_data *peer_data,
         int offset, proto_tree *tree)
 {
@@ -1041,10 +1156,47 @@ ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
     guint plen;
 
     len = tvb_reported_length_remaining(tvb, offset);
-    col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (len=%d)", len);
+if (offset == 0) {
+    if (len > 4) {
+	char chars1[64 * 2 + 5];
+		guint i = 0;
+        for (i = 0; i < 64; i += 1) {
+			sprintf((char*)  (chars1 + (2 * i)), "%02hhX", global_data->key0[i]);
+		}
+		g_print("WSDUMP KEY_DUMP_0 %s\n", chars1);
+    // gint captured_length = tvb_captured_length(tvb);
+    g_print("Offset %i\n", offset);
+    // if (offset == 0 && captured_length >= 4) {
+    guchar* packet_len = (guchar*) tvb_get_ptr(tvb, offset, 4);
+    guint32 payload_len = 0;
+    openssh_chacha20_poly1305_decrypt_len(global_data->key0, global_data->current_seqnr, packet_len, &payload_len);
+     offset += 4;
 
-    if (tree) {
-        gint encrypted_len = len;
+    g_print("Found length %u\n", payload_len);
+
+    guint32 packet_length = payload_len + 16;
+    if (packet_length < 1000) {
+        guchar* target = (guchar*) wmem_alloc0(wmem_file_scope(), packet_length * sizeof(guchar));
+        
+        tvb_memcpy(tvb, target, offset, packet_length);
+
+        guchar* outbuf = (guchar*) wmem_alloc0(wmem_file_scope(), packet_length * sizeof(guchar));
+
+        openssh_chacha20_poly1305_decrypt(global_data->key0, global_data->current_seqnr, target, packet_length, outbuf);
+  
+        col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (len=%d) with %s", len, (gchar*) outbuf);
+
+        wmem_free(wmem_file_scope(), target);
+        wmem_free(wmem_file_scope(), outbuf);
+    } else {
+        g_print("an insane packet length was found...\n");
+    }
+    } else {
+        g_print("len too small %i\n", len);
+    }
+
+} else {
+     gint encrypted_len = len;
 
         if (len > 4 && peer_data->length_is_plaintext) {
             plen = tvb_get_ntohl(tvb, offset) ;
@@ -1066,7 +1218,9 @@ ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
             proto_tree_add_item(tree, hf_ssh_mac_string,
                 tvb, offset + 4 + encrypted_len,
                 peer_data->mac_length, ENC_NA);
-    }
+    g_print("current seqnr: %i\n", (int) global_data->current_seqnr);
+    g_print("Offset is not beginning... %i\n", offset);
+}
     offset+=len;
     return offset;
 }
@@ -1085,7 +1239,7 @@ ssh_dissect_protocol(tvbuff_t *tvb, packet_info *pinfo,
      *  it is dump in the middle of a flow or not a ssh at all
      */
     if (tvb_strncaseeql(tvb, offset, "SSH-", 4) != 0) {
-        offset = ssh_dissect_encrypted_packet(tvb, pinfo,
+        offset = ssh_dissect_encrypted_packet(tvb, pinfo, global_data,
             &global_data->peer_data[is_response], offset, tree);
         return offset;
     }
