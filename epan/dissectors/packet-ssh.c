@@ -44,6 +44,7 @@
 #include <epan/sctpppids.h>
 #include <epan/prefs.h>
 #include <epan/expert.h>
+#include <epan/proto_data.h>
 #include <wsutil/strtoi.h>
 #include <wsutil/wsgcrypt.h>
 
@@ -100,11 +101,14 @@ struct ssh_flow_data {
     guint   version;
 
     gchar*  kex;
-    gchar* key0;
-    gchar* key1;
+    guchar* key0;
+    guchar* key1;
     guint key0_len;
     guint key1_len;
-    guint64 current_seqnr;
+    address src;
+    address dest;
+    guint64 current_sent_seqnr;
+    guint64 current_recv_seqnr;
     int   (*kex_specific_dissector)(guint8 msg_code, tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree);
 
     /* [0] is client's, [1] is server's */
@@ -404,7 +408,7 @@ enum { MAXL = 40, MAXC = 260 };
 
 
 gcry_error_t
-openssh_chacha20_poly1305_decrypt_len(const guchar *key, guint64 pkt_seq_number, const guchar *encrypted_pkt, guint32 *payload_len) {
+openssh_chacha20_poly1305_decrypt_len(const guchar *key, guint32 pkt_seq_number, const guchar *encrypted_pkt, guint32 *payload_len) {
     // cipher1 decrypts packet length header, cipher2 decrypts packet payload
 	gcry_cipher_hd_t cipher1;
     gcry_error_t err = 0;
@@ -417,8 +421,8 @@ openssh_chacha20_poly1305_decrypt_len(const guchar *key, guint64 pkt_seq_number,
 	
 	// convert the sequence number from 64-bit unsigned int to 64-bit big endian byte array
 	guchar seqbuf[8];
-    g_print("sequence number: %i\n", (int) pkt_seq_number);
-    	POKE_U64(seqbuf, pkt_seq_number);
+    g_print("sequence number: %u\n", pkt_seq_number);
+    POKE_U64(seqbuf, pkt_seq_number);
 	
 	// set up variables for reading packet payload length
 	guchar lenbuf[4];
@@ -429,9 +433,10 @@ openssh_chacha20_poly1305_decrypt_len(const guchar *key, guint64 pkt_seq_number,
 	err = gcry_cipher_setiv(cipher1, seqbuf, 8);
 	err = gcry_cipher_decrypt(cipher1, lenbuf, 4, encrypted_pkt, 4);
 
-    
     guint32 actlen =  PEEK_U32(lenbuf);
+    guint64 actlen64 =  PEEK_U32(lenbuf);
     g_print("Found internal length %u\n", actlen);
+    g_print("Found internal length2 %lu\n", actlen64);
 	*payload_len = actlen;
     return err;
 }
@@ -539,6 +544,24 @@ parse_ssh_file(const gchar *file_path, guchar **key0, guint *len0, guchar **key1
     parse_ssh_key(val_1, key1, len1);
 }
 
+typedef struct {
+  guint32 seqnr;
+  gboolean is_sent;
+} ssh_packet_private_data_t;
+
+static ssh_packet_private_data_t*
+ssh_get_packet_data(packet_info *pinfo, gboolean is_sent, guint32 current_seq)
+{
+  ssh_packet_private_data_t *packet_data = (ssh_packet_private_data_t*) p_get_proto_data(pinfo->pool, pinfo, proto_ssh, 0);
+  if (!packet_data) {
+    packet_data = wmem_new0(pinfo->pool, ssh_packet_private_data_t);
+    packet_data->seqnr = current_seq;
+    packet_data->is_sent = is_sent;
+    p_add_proto_data(pinfo->pool, pinfo, proto_ssh, 0, packet_data);
+  }
+  return packet_data;
+}
+
 static int
 dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
 {
@@ -571,7 +594,8 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
     
     if (!global_data) {
         global_data = (struct ssh_flow_data *)wmem_alloc0(wmem_file_scope(), sizeof(struct ssh_flow_data));
-        global_data->current_seqnr = 0;
+        global_data->current_sent_seqnr = 0;
+        global_data->current_recv_seqnr = 0;
         global_data->version=SSH_VERSION_UNKNOWN;
         global_data->kex_specific_dissector=ssh_dissect_kex_dh;
         global_data->key0 = key0;
@@ -580,6 +604,8 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
         global_data->key1_len = len1;
         global_data->peer_data[CLIENT_PEER_DATA].mac_length=-1;
         global_data->peer_data[SERVER_PEER_DATA].mac_length=-1;
+        global_data->dest = pinfo->dst;
+        global_data->src =  pinfo->src;
 
         g_print("key0 found: %u with len\n", len0);
         g_print("key1 found: %u with len\n", len1);
@@ -587,14 +613,29 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
         conversation_add_proto_data(conversation, proto_ssh, global_data);
     } else {
         // TODO: Where should this go?
-        global_data->current_seqnr = global_data->current_seqnr + 1;
+        if (!PINFO_FD_VISITED(pinfo)) {
+            if (addresses_equal(conversation_key_addr1(conversation->key_ptr), &pinfo->net_src)) {
+               global_data->current_sent_seqnr = global_data->current_sent_seqnr + 1;
+            } else {
+               global_data->current_recv_seqnr = global_data->current_recv_seqnr + 1;
+            }
+        }
     }
 
     peer_data = &global_data->peer_data[is_response];
 
     ti = proto_tree_add_item(tree, proto_ssh, tvb, offset, -1, ENC_NA);
     ssh_tree = proto_item_add_subtree(ti, ett_ssh);
-
+    
+    // This will initialize the data
+    // TODO Clean this up.
+     
+    if (addresses_equal(conversation_key_addr1(conversation->key_ptr), &pinfo->net_src)) {
+        ssh_get_packet_data(pinfo, TRUE, global_data->current_sent_seqnr);
+    } else {
+        ssh_get_packet_data(pinfo, FALSE, global_data->current_recv_seqnr);
+    }
+    
     version = global_data->version;
 
     switch(version) {
@@ -1156,6 +1197,7 @@ ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo, struct ssh_flow_
     guint plen;
 
     len = tvb_reported_length_remaining(tvb, offset);
+    guint len_real = tvb_reported_length(tvb);
 if (offset == 0) {
     if (len > 4) {
 	char chars1[64 * 2 + 5];
@@ -1166,11 +1208,18 @@ if (offset == 0) {
 		g_print("WSDUMP KEY_DUMP_0 %s\n", chars1);
     // gint captured_length = tvb_captured_length(tvb);
     g_print("Offset %i\n", offset);
+   
     // if (offset == 0 && captured_length >= 4) {
     guchar* packet_len = (guchar*) tvb_get_ptr(tvb, offset, 4);
     guint32 payload_len = 0;
-    openssh_chacha20_poly1305_decrypt_len(global_data->key0, global_data->current_seqnr, packet_len, &payload_len);
-     offset += 4;
+        
+    ssh_packet_private_data_t* packet_data = ssh_get_packet_data(pinfo, FALSE, 0);
+    g_print("Found seqnr for len %u\n", packet_data->seqnr);
+       g_print("Found lens a %u and b %u\n", len, len_real);
+        g_print("Is sent: %s\n", packet_data->is_sent ? "yes" : "no");
+    openssh_chacha20_poly1305_decrypt_len(packet_data->is_sent ? global_data->key1 : global_data->key0, packet_data->seqnr, packet_len, &payload_len);
+    
+    offset += 4;
 
     g_print("Found length %u\n", payload_len);
 
@@ -1182,7 +1231,7 @@ if (offset == 0) {
 
         guchar* outbuf = (guchar*) wmem_alloc0(wmem_file_scope(), packet_length * sizeof(guchar));
 
-        openssh_chacha20_poly1305_decrypt(global_data->key0, global_data->current_seqnr, target, packet_length, outbuf);
+        openssh_chacha20_poly1305_decrypt(packet_data->is_sent ? global_data->key1 : global_data->key0, packet_data->seqnr, target, packet_length, outbuf);
   
         col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (len=%d) with %s", len, (gchar*) outbuf);
 
@@ -1218,7 +1267,8 @@ if (offset == 0) {
             proto_tree_add_item(tree, hf_ssh_mac_string,
                 tvb, offset + 4 + encrypted_len,
                 peer_data->mac_length, ENC_NA);
-    g_print("current seqnr: %i\n", (int) global_data->current_seqnr);
+    g_print("current seqnr: %i\n", (int) global_data->current_recv_seqnr);
+    g_print("current seqnr: %i\n", (int) global_data->current_sent_seqnr);
     g_print("Offset is not beginning... %i\n", offset);
 }
     offset+=len;
