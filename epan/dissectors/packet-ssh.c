@@ -552,12 +552,12 @@ typedef struct {
 static ssh_packet_private_data_t*
 ssh_get_packet_data(packet_info *pinfo, gboolean is_sent, guint32 current_seq)
 {
-  ssh_packet_private_data_t *packet_data = (ssh_packet_private_data_t*) p_get_proto_data(pinfo->pool, pinfo, proto_ssh, 0);
+  ssh_packet_private_data_t *packet_data = (ssh_packet_private_data_t*) p_get_proto_data(wmem_file_scope(), pinfo, proto_ssh, 0);
   if (!packet_data) {
-    packet_data = wmem_new0(pinfo->pool, ssh_packet_private_data_t);
+    packet_data = wmem_new0(wmem_file_scope(), ssh_packet_private_data_t);
     packet_data->seqnr = current_seq;
     packet_data->is_sent = is_sent;
-    p_add_proto_data(pinfo->pool, pinfo, proto_ssh, 0, packet_data);
+    p_add_proto_data(wmem_file_scope(), pinfo, proto_ssh, 0, packet_data);
   }
   return packet_data;
 }
@@ -632,7 +632,9 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
      
     if (addresses_equal(conversation_key_addr1(conversation->key_ptr), &pinfo->net_src)) {
         ssh_get_packet_data(pinfo, TRUE, global_data->current_sent_seqnr);
-    } else {
+    }
+    
+    if (addresses_equal(conversation_key_addr1(conversation->key_ptr), &pinfo->net_dst)) {
         ssh_get_packet_data(pinfo, FALSE, global_data->current_recv_seqnr);
     }
     
@@ -1215,9 +1217,9 @@ if (offset == 0) {
         
     ssh_packet_private_data_t* packet_data = ssh_get_packet_data(pinfo, FALSE, 0);
     g_print("Found seqnr for len %u\n", packet_data->seqnr);
-       g_print("Found lens a %u and b %u\n", len, len_real);
-        g_print("Is sent: %s\n", packet_data->is_sent ? "yes" : "no");
-    openssh_chacha20_poly1305_decrypt_len(packet_data->is_sent ? global_data->key1 : global_data->key0, packet_data->seqnr, packet_len, &payload_len);
+    g_print("Found lens a %u and b %u\n", len, len_real);
+    g_print("Is sent: %s\n", packet_data->is_sent ? "yes" : "no");
+    openssh_chacha20_poly1305_decrypt_len(packet_data->is_sent ? global_data->key1 : global_data->key0, packet_data->is_sent ? packet_data->seqnr - 1 : packet_data->seqnr, packet_len, &payload_len);
     
     offset += 4;
 
@@ -1233,12 +1235,13 @@ if (offset == 0) {
 
         openssh_chacha20_poly1305_decrypt(packet_data->is_sent ? global_data->key1 : global_data->key0, packet_data->seqnr, target, packet_length, outbuf);
   
-        col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (len=%d) with %s", len, (gchar*) outbuf);
+        col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (unlen=%d and len=%d) of seq %u with %s", len, packet_length, packet_data->seqnr, (gchar*) outbuf);
 
         wmem_free(wmem_file_scope(), target);
         wmem_free(wmem_file_scope(), outbuf);
     } else {
         g_print("an insane packet length was found...\n");
+         col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (unlen=%d and len=%u)  of seq %u", len, packet_length, packet_data->seqnr);
     }
     } else {
         g_print("len too small %i\n", len);
