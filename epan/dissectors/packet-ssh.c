@@ -105,8 +105,6 @@ struct ssh_flow_data {
     guchar* key1;
     guint key0_len;
     guint key1_len;
-    address src;
-    address dest;
     guint64 current_sent_seqnr;
     guint64 current_recv_seqnr;
     int   (*kex_specific_dissector)(guint8 msg_code, tvbuff_t *tvb, packet_info *pinfo, int offset, proto_tree *tree);
@@ -604,8 +602,6 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
         global_data->key1_len = len1;
         global_data->peer_data[CLIENT_PEER_DATA].mac_length=-1;
         global_data->peer_data[SERVER_PEER_DATA].mac_length=-1;
-        global_data->dest = pinfo->dst;
-        global_data->src =  pinfo->src;
 
         g_print("key0 found: %u with len\n", len0);
         g_print("key1 found: %u with len\n", len1);
