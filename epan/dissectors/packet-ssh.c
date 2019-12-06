@@ -47,6 +47,7 @@
 #include <epan/proto_data.h>
 #include <wsutil/strtoi.h>
 #include <wsutil/wsgcrypt.h>
+#include <wsutil/file_util.h>
 
 #include "packet-tcp.h"
 
@@ -211,6 +212,7 @@ static gint ett_ssh2 = -1;
 static expert_field ei_ssh_packet_length = EI_INIT;
 
 static gboolean ssh_desegment = TRUE;
+static const char *keydump_filepath;
 
 static dissector_handle_t ssh_handle;
 
@@ -494,26 +496,19 @@ static void parse_ssh_key(gchar* val_0, guchar** arr, guint* len_) {
 }
 
 static void
-parse_ssh_file(gchar *file_path, guchar **key0, guint *len0, guchar **key1, guint *len1) {
-    GError *error = NULL;
-    gsize *len = NULL;
-    gchar *content;
-    gboolean success = g_file_get_contents(file_path, &content, len, &error);
-
-    if (!success) {
-        printf("CS5152: Failed!");
-    }
+parse_ssh_file(const gchar *file_path, guchar **key0, guint *len0, guchar **key1, guint *len1) {
+    FILE* file = ws_fopen(file_path, "r");
    
     // STEP 2: File tokenizing
-   
-    gchar** file = g_strsplit(content, "\n", 30000);
-    guint length = g_strv_length(file);
     
     gchar* val_0 = NULL;
     gchar* val_1 = NULL;
+
+    gchar buf[256]; // No line we care about will exceed 256 characters.
     
-    for (guint i = 0; i < length; i++) {
-        gchar *line = file[i];
+    // TODO It may need to be sizeof(buf) +- 1 to add a null character.
+    while(fgets(buf, sizeof(buf), file)) {
+        gchar *line = g_strdup(buf);
         gchar** vals = g_strsplit(line, " ", 10);
 
         guint line_length = g_strv_length(vals);
@@ -537,7 +532,12 @@ parse_ssh_file(gchar *file_path, guchar **key0, guint *len0, guchar **key1, guin
                 } 
             }
         }
+        
+        g_free(line);
+        memset(buf, 0, 256);
     }
+
+    fclose(file);
 
     parse_ssh_key(val_0, key0, len0);
     parse_ssh_key(val_1, key1, len1);
@@ -595,7 +595,7 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
     global_data = (struct ssh_flow_data *)conversation_get_proto_data(conversation, proto_ssh);
     
     if (!global_data) {
-        gchar* file_path =   "/home/evan/openssh-dump/special_dump.txt"; //getenv("WIRESHARK_SSH_DECRYPTION_FILE");
+        const gchar* file_path = keydump_filepath;
         g_print("Loading file from... %s\n", file_path);
         guchar* key0 = NULL;
         guchar* key1 = NULL;
@@ -626,7 +626,7 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
         conversation_add_proto_data(conversation, proto_ssh, global_data);
     }
 
-        // TODO: Where should this go?
+    // TODO: Where should this go?
     if (!PINFO_FD_VISITED(pinfo)) {
          if (!sent_by_server) {
          
@@ -672,9 +672,6 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
     
     // This will initialize the data
     // TODO Clean this up.
-    
-
- 
     
     version = global_data->version;
 
@@ -1240,6 +1237,7 @@ ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo, struct ssh_flow_
         g_print("Starting Offset %i\n", offset);
 
         // This is the *encrypted* packet length.
+        // TODO Remove this usage of tvb_get_ptr
         guchar *packet_len = (guchar *)tvb_get_ptr(tvb, offset, 4);
         guint32 payload_len = 0;
 
@@ -2007,6 +2005,14 @@ proto_register_ssh(void)
                        "Whether the SSH dissector should reassemble SSH buffers spanning multiple TCP segments. "
                        "To use this option, you must also enable \"Allow subdissectors to reassemble TCP streams\" in the TCP protocol settings.",
                        &ssh_desegment);
+
+    prefs_register_filename_preference(ssh_module, "keydump_file", "Key Dump Filename",
+                                       "The path to the debug log which contains a list of SSH internal keys in the following format:\n"
+                                       "\"WSDUMP KEY_LEN_0 64 64\".\n"
+                                       "\"WSDUMP KEY_LEN_1 64 64\".\n"
+                                       "\"WSDUMP KEY_DUMP_0 <hex-formatted-key>\".\n"
+                                       "\"WSDUMP KEY_DUMP_1 <hex-formatted-key>\".\n",
+                                       &keydump_filepath, FALSE);
 
     ssh_handle = register_dissector("ssh", dissect_ssh, proto_ssh);
 }
