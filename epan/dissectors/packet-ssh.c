@@ -106,6 +106,7 @@ struct ssh_flow_data {
     guchar* key1;
     guint key0_len;
     guint key1_len;
+    // TODO This should be guint32 per the specification
     guint64 client_received_seqnr;
     guint64 server_received_seqnr;
     gboolean client_received_none;
