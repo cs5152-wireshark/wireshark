@@ -173,3 +173,6 @@ vgcore.*
 Wireshark.*
 .pytest_cache/
 test/*.log
+
+# Temporary fix.
+build/**
