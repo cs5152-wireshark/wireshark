@@ -195,6 +195,7 @@ static gint ett_key_exchange_host_key = -1;
 static gint ett_key_init = -1;
 static gint ett_ssh1 = -1;
 static gint ett_ssh2 = -1;
+static gint ett_decrypted = -1;
 
 static expert_field ei_ssh_packet_length = EI_INIT;
 
@@ -335,10 +336,10 @@ static int ssh_dissect_ssh2(tvbuff_t *tvb, packet_info *pinfo,
         struct ssh_flow_data *global_data,
         int offset, proto_tree *tree, int is_response,
         gboolean *need_desegmentation);
-static int ssh_dissect_key_exchange(tvbuff_t *tvb, packet_info *pinfo,
-        struct ssh_flow_data *global_data,
-        int offset, proto_tree *tree, int is_response,
-        gboolean *need_desegmentation);
+// static int ssh_dissect_key_exchange(tvbuff_t *tvb, packet_info *pinfo,
+//         struct ssh_flow_data *global_data,
+//         int offset, proto_tree *tree, int is_response,
+//         gboolean *need_desegmentation);
 static int ssh_dissect_kex_dh(guint8 msg_code, tvbuff_t *tvb,
         packet_info *pinfo, int offset, proto_tree *tree);
 static int ssh_dissect_kex_dh_gex(guint8 msg_code, tvbuff_t *tvb,
@@ -347,9 +348,24 @@ static int ssh_dissect_protocol(tvbuff_t *tvb, packet_info *pinfo,
         struct ssh_flow_data *global_data,
         int offset, proto_tree *tree, int is_response, guint *version,
         gboolean *need_desegmentation);
+// static int ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
+//         struct ssh_peer_data *peer_data,
+//         int offset, proto_tree *tree);
 static int ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
-        struct ssh_peer_data *peer_data,
-        int offset, proto_tree *tree);
+        struct ssh_flow_data *global_data,
+        int offset, proto_tree *tree, int is_response,
+        gboolean *need_desegmentation);
+static int ssh_dissect_decrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
+        struct ssh_flow_data *global_data,
+        int offset, proto_tree *tree, int is_response,
+        gboolean *need_desegmentation);
+static int ssh_dissect_transport_algorithm_negotiation(tvbuff_t *tvb, packet_info *pinfo,
+        struct ssh_flow_data *global_data,
+        int offset, proto_tree *tree, int is_response,
+        guint8 msg_code);
+
+
+
 static void ssh_choose_algo(gchar *client, gchar *server, gchar **result);
 static void ssh_set_mac_length(struct ssh_peer_data *peer_data);
 static void ssh_set_kex_specific_dissector(struct ssh_flow_data *global_data);
@@ -434,8 +450,9 @@ dissect_ssh(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
             switch(version) {
 
             case SSH_VERSION_UNKNOWN:
-                offset = ssh_dissect_encrypted_packet(tvb, pinfo,
-                        &global_data->peer_data[is_response], offset, ssh_tree);
+                offset = ssh_dissect_encrypted_packet(tvb, pinfo, global_data,
+                        offset, ssh_tree, is_response,
+                        &need_desegmentation);
                 break;
 
             case SSH_VERSION_1:
@@ -503,12 +520,17 @@ ssh_dissect_ssh2(tvbuff_t *tvb, packet_info *pinfo,
         ((peer_data->frame_key_start <= pinfo->num) &&
         ((peer_data->frame_key_end == 0) || (pinfo->num < peer_data->frame_key_end) ||
                 ((pinfo->num == peer_data->frame_key_end) && (offset < peer_data->frame_key_end_offset))))) {
-        offset = ssh_dissect_key_exchange(tvb, pinfo, global_data,
+        offset = ssh_dissect_decrypted_packet(tvb, pinfo, global_data,
+                offset, ssh2_tree, is_response,
+                need_desegmentation);
+
+        // offset = ssh_dissect_key_exchange(tvb, pinfo, global_data,
+        //     offset, ssh2_tree, is_response,
+        //     need_desegmentation);
+    } else {
+        offset = ssh_dissect_encrypted_packet(tvb, pinfo, global_data,
             offset, ssh2_tree, is_response,
             need_desegmentation);
-    } else {
-        offset = ssh_dissect_encrypted_packet(tvb, pinfo,
-                &global_data->peer_data[is_response], offset, ssh2_tree);
     }
 
     if (ssh2_tree) {
@@ -703,7 +725,7 @@ ssh_tree_add_hostkey(tvbuff_t *tvb, int offset, proto_tree *parent_tree, const c
 }
 
 static int
-ssh_dissect_key_exchange(tvbuff_t *tvb, packet_info *pinfo,
+ssh_dissect_decrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
         struct ssh_flow_data *global_data,
         int offset, proto_tree *tree, int is_response,
         gboolean *need_desegmentation)
@@ -715,9 +737,7 @@ ssh_dissect_key_exchange(tvbuff_t *tvb, packet_info *pinfo,
     guint   msg_code;
 
     proto_item *ti;
-    proto_item *key_ex_tree =NULL;
-
-    struct ssh_peer_data *peer_data = &global_data->peer_data[is_response];
+    proto_item *msg_type_tree = NULL;
 
     /*
      * We use "tvb_ensure_captured_length_remaining()" to make sure there
@@ -776,66 +796,79 @@ ssh_dissect_key_exchange(tvbuff_t *tvb, packet_info *pinfo,
     proto_tree_add_uint(tree, hf_ssh_padding_length, tvb, offset, 1, padding_length);
     offset += 1;
 
-    key_ex_tree=proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Key Exchange");
-
     /* msg_code */
     msg_code = tvb_get_guint8(tvb, offset);
 
-    if (msg_code >= 30 && msg_code < 40) {
-        offset = global_data->kex_specific_dissector(msg_code, tvb, pinfo, offset, key_ex_tree);
-    } else {
-        proto_tree_add_item(key_ex_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
-        offset += 1;
+    /* Transport layer protocol */
+    /* Generic (1-19) */
+    if(msg_code >= 1 && msg_code <= 19) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: Transport (generic)");
+        proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+        offset+=1;
+        // TODO: offset = ssh_dissect_transport_generic(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
+    }
+    /* Algorithm negotiation (20-29) */
+    else if(msg_code >=20 && msg_code <= 29) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: Transport (algorithm negotiation)");
+        offset = ssh_dissect_transport_algorithm_negotiation(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
+    }
+    /* Key exchange method specific (reusable) (30-49) */
+    else if (msg_code >=30 && msg_code <= 49) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: Transport (key exchange method specific)");
+        offset = global_data->kex_specific_dissector(msg_code, tvb, pinfo, offset, msg_type_tree);
+    }
 
-        col_append_sep_str(pinfo->cinfo, COL_INFO, NULL,
-            val_to_str(msg_code, ssh2_msg_vals, "Unknown (%u)"));
+    /* User authentication protocol */
+    /* Generic (50-59) */
+    else if (msg_code >= 50 && msg_code <= 59) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: User Authentication (generic)");
+        proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+        offset+=1;
+        // TODO: offset = ssh_dissect_userauth_generic(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
+    }
+    /* User authentication method specific (reusable) (60-79) */
+    else if (msg_code >= 60 && msg_code <= 79) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: User Authentication: (method specific)");
+        proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+        offset+=1;
+        // TODO: offset = ssh_dissect_userauth_specific(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
+    }
 
-        /* 16 bytes cookie  */
-        switch(msg_code)
-        {
-        case SSH_MSG_KEXINIT:
-            if ((peer_data->frame_key_start == 0) || (peer_data->frame_key_start == pinfo->num)) {
-                offset = ssh_dissect_key_init(tvb, offset, key_ex_tree, is_response, global_data);
-                peer_data->frame_key_start = pinfo->num;
-            }
-            break;
-        case SSH_MSG_NEWKEYS:
-            if (peer_data->frame_key_end == 0) {
-                peer_data->frame_key_end = pinfo->num;
-                peer_data->frame_key_end_offset = offset;
-                ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].enc_proposals[is_response],
-                                global_data->peer_data[SERVER_PEER_DATA].enc_proposals[is_response],
-                                &peer_data->enc);
+    /* Connection protocol */
+    /* Generic (80-89) */
+    else if (msg_code >= 80 && msg_code <= 89) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: Connection (generic)");
+        proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+        offset+=1;
+        // TODO: offset = ssh_dissect_connection_generic(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
+    }
+    /* Channel related messages (90-127) */
+    else if (msg_code >= 90 && msg_code <= 127) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: Connection: (channel related message)");
+        proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+        offset+=1;
+        // TODO: offset = ssh_dissect_connection_channel(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
+    }
 
-                /* some ciphers have their own MAC so the "negotiated" one is meaningless */
-                if(peer_data->enc && (0 == strcmp(peer_data->enc, "aes128-gcm@openssh.com") ||
-                                      0 == strcmp(peer_data->enc, "aes256-gcm@openssh.com"))) {
-                    peer_data->mac = wmem_strdup(wmem_file_scope(), (const gchar *)"<implicit>");
-                    peer_data->mac_length = 16;
-                    peer_data->length_is_plaintext = 1;
-                }
-                else if(peer_data->enc && 0 == strcmp(peer_data->enc, "chacha20-poly1305@openssh.com")) {
-                    peer_data->mac = wmem_strdup(wmem_file_scope(), (const gchar *)"<implicit>");
-                    peer_data->mac_length = 16;
-                }
-                else {
-                    ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].mac_proposals[is_response],
-                                    global_data->peer_data[SERVER_PEER_DATA].mac_proposals[is_response],
-                                    &peer_data->mac);
-                    ssh_set_mac_length(peer_data);
-                }
+    /* Reserved for client protocols (128-191) */
+    else if (msg_code >= 128 && msg_code <= 191) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: Client protocol");
+        proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+        offset+=1;
+        // TODO: offset = ssh_dissect_client(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
+    }
 
-                ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].comp_proposals[is_response],
-                                global_data->peer_data[SERVER_PEER_DATA].comp_proposals[is_response],
-                                &peer_data->comp);
-            }
-            break;
-        }
+    /* Local extensions (192-255) */
+    else if (msg_code >= 192 && msg_code <= 255) {
+        msg_type_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Message: Local extension");
+        proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+        offset+=1;
+        // TODO: offset = ssh_dissect_local_extention(tvb, pinfo, global_data, offset, msg_type_tree, is_response, msg_code);
     }
 
     len = plen+4-padding_length-(offset-last_offset);
     if (len > 0) {
-        proto_tree_add_item(key_ex_tree, hf_ssh_payload, tvb, offset, len, ENC_NA);
+        proto_tree_add_item(msg_type_tree, hf_ssh_payload, tvb, offset, len, ENC_NA);
     }
     offset +=len;
 
@@ -845,6 +878,209 @@ ssh_dissect_key_exchange(tvbuff_t *tvb, packet_info *pinfo,
 
     return offset;
 }
+
+static int
+ssh_dissect_transport_algorithm_negotiation(tvbuff_t *tvb, packet_info *pinfo,
+        struct ssh_flow_data *global_data,
+        int offset, proto_tree *tree, int is_response,
+        guint8 msg_code)
+{
+    struct ssh_peer_data *peer_data = &global_data->peer_data[is_response];
+
+    proto_tree_add_item(tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+    offset += 1;
+
+    col_append_sep_str(pinfo->cinfo, COL_INFO, NULL,
+        val_to_str(msg_code, ssh2_msg_vals, "Unknown (%u)"));
+
+    /* 16 bytes cookie  */
+    switch(msg_code)
+    {
+    case SSH_MSG_KEXINIT:
+        if ((peer_data->frame_key_start == 0) || (peer_data->frame_key_start == pinfo->num)) {
+            offset = ssh_dissect_key_init(tvb, offset, tree, is_response, global_data);
+            peer_data->frame_key_start = pinfo->num;
+        }
+        break;
+    case SSH_MSG_NEWKEYS:
+        if (peer_data->frame_key_end == 0) {
+            peer_data->frame_key_end = pinfo->num;
+            peer_data->frame_key_end_offset = offset;
+            ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].enc_proposals[is_response],
+                            global_data->peer_data[SERVER_PEER_DATA].enc_proposals[is_response],
+                            &peer_data->enc);
+
+            /* some ciphers have their own MAC so the "negotiated" one is meaningless */
+            if(peer_data->enc && (0 == strcmp(peer_data->enc, "aes128-gcm@openssh.com") ||
+                                0 == strcmp(peer_data->enc, "aes256-gcm@openssh.com"))) {
+                peer_data->mac = wmem_strdup(wmem_file_scope(), (const gchar *)"<implicit>");
+                peer_data->mac_length = 16;
+                peer_data->length_is_plaintext = 1;
+            }
+            else if(peer_data->enc && 0 == strcmp(peer_data->enc, "chacha20-poly1305@openssh.com")) {
+                peer_data->mac = wmem_strdup(wmem_file_scope(), (const gchar *)"<implicit>");
+                peer_data->mac_length = 16;
+            }
+            else {
+                ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].mac_proposals[is_response],
+                                global_data->peer_data[SERVER_PEER_DATA].mac_proposals[is_response],
+                                &peer_data->mac);
+                ssh_set_mac_length(peer_data);
+            }
+
+            ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].comp_proposals[is_response],
+                            global_data->peer_data[SERVER_PEER_DATA].comp_proposals[is_response],
+                            &peer_data->comp);
+        }
+        break;
+    }
+
+    return offset;
+}
+
+// static int
+// ssh_dissect_key_exchange(tvbuff_t *tvb, packet_info *pinfo,
+//         struct ssh_flow_data *global_data,
+//         int offset, proto_tree *tree, int is_response,
+//         gboolean *need_desegmentation)
+// {
+//     guint   plen, len;
+//     guint8  padding_length;
+//     guint   remain_length;
+//     int     last_offset=offset;
+//     guint   msg_code;
+
+//     proto_item *ti;
+//     proto_item *msg_type_tree =NULL;
+
+//     struct ssh_peer_data *peer_data = &global_data->peer_data[is_response];
+
+//     /*
+//      * We use "tvb_ensure_captured_length_remaining()" to make sure there
+//      * actually *is* data remaining.
+//      *
+//      * This means we're guaranteed that "remain_length" is positive.
+//      */
+//     remain_length = tvb_ensure_captured_length_remaining(tvb, offset);
+//     /*
+//      * Can we do reassembly?
+//      */
+//     if (ssh_desegment && pinfo->can_desegment) {
+//         /*
+//          * Yes - would an SSH header starting at this offset
+//          * be split across segment boundaries?
+//          */
+//         if (remain_length < 4) {
+//             /*
+//              * Yes.  Tell the TCP dissector where the data for
+//              * this message starts in the data it handed us and
+//              * that we need "some more data."  Don't tell it
+//              * exactly how many bytes we need because if/when we
+//              * ask for even more (after the header) that will
+//              * break reassembly.
+//              */
+//             pinfo->desegment_offset = offset;
+//             pinfo->desegment_len = DESEGMENT_ONE_MORE_SEGMENT;
+//             *need_desegmentation = TRUE;
+//             return offset;
+//         }
+//     }
+//     plen = tvb_get_ntohl(tvb, offset) ;
+
+//     if (ssh_desegment && pinfo->can_desegment) {
+//         if (plen +4 >  remain_length) {
+//             pinfo->desegment_offset = offset;
+//             pinfo->desegment_len = plen+4 - remain_length;
+//             *need_desegmentation = TRUE;
+//             return offset;
+//         }
+//     }
+//     /*
+//      * Need to check plen > 0x80000000 here
+//      */
+
+//     ti = proto_tree_add_uint(tree, hf_ssh_packet_length, tvb,
+//                     offset, 4, plen);
+//     if (plen >= 0xffff) {
+//         expert_add_info_format(pinfo, ti, &ei_ssh_packet_length, "Overly large number %d", plen);
+//         plen = remain_length-4;
+//     }
+//     offset+=4;
+
+//     /* padding length */
+//     padding_length = tvb_get_guint8(tvb, offset);
+//     proto_tree_add_uint(tree, hf_ssh_padding_length, tvb, offset, 1, padding_length);
+//     offset += 1;
+
+//     msg_type_tree=proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_key_exchange, NULL, "Key Exchange");
+
+//     /* msg_code */
+//     msg_code = tvb_get_guint8(tvb, offset);
+
+//     if (msg_code >= 30 && msg_code < 40) {
+//         offset = global_data->kex_specific_dissector(msg_code, tvb, pinfo, offset, msg_type_tree);
+//     } else {
+//         proto_tree_add_item(msg_type_tree, hf_ssh2_msg_code, tvb, offset, 1, ENC_BIG_ENDIAN);
+//         offset += 1;
+
+//         col_append_sep_str(pinfo->cinfo, COL_INFO, NULL,
+//             val_to_str(msg_code, ssh2_msg_vals, "Unknown (%u)"));
+
+//         /* 16 bytes cookie  */
+//         switch(msg_code)
+//         {
+//         case SSH_MSG_KEXINIT:
+//             if ((peer_data->frame_key_start == 0) || (peer_data->frame_key_start == pinfo->num)) {
+//                 offset = ssh_dissect_key_init(tvb, offset, msg_type_tree, is_response, global_data);
+//                 peer_data->frame_key_start = pinfo->num;
+//             }
+//             break;
+//         case SSH_MSG_NEWKEYS:
+//             if (peer_data->frame_key_end == 0) {
+//                 peer_data->frame_key_end = pinfo->num;
+//                 peer_data->frame_key_end_offset = offset;
+//                 ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].enc_proposals[is_response],
+//                                 global_data->peer_data[SERVER_PEER_DATA].enc_proposals[is_response],
+//                                 &peer_data->enc);
+
+//                 /* some ciphers have their own MAC so the "negotiated" one is meaningless */
+//                 if(peer_data->enc && (0 == strcmp(peer_data->enc, "aes128-gcm@openssh.com") ||
+//                                       0 == strcmp(peer_data->enc, "aes256-gcm@openssh.com"))) {
+//                     peer_data->mac = wmem_strdup(wmem_file_scope(), (const gchar *)"<implicit>");
+//                     peer_data->mac_length = 16;
+//                     peer_data->length_is_plaintext = 1;
+//                 }
+//                 else if(peer_data->enc && 0 == strcmp(peer_data->enc, "chacha20-poly1305@openssh.com")) {
+//                     peer_data->mac = wmem_strdup(wmem_file_scope(), (const gchar *)"<implicit>");
+//                     peer_data->mac_length = 16;
+//                 }
+//                 else {
+//                     ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].mac_proposals[is_response],
+//                                     global_data->peer_data[SERVER_PEER_DATA].mac_proposals[is_response],
+//                                     &peer_data->mac);
+//                     ssh_set_mac_length(peer_data);
+//                 }
+
+//                 ssh_choose_algo(global_data->peer_data[CLIENT_PEER_DATA].comp_proposals[is_response],
+//                                 global_data->peer_data[SERVER_PEER_DATA].comp_proposals[is_response],
+//                                 &peer_data->comp);
+//             }
+//             break;
+//         }
+//     }
+
+//     len = plen+4-padding_length-(offset-last_offset);
+//     if (len > 0) {
+//         proto_tree_add_item(msg_type_tree, hf_ssh_payload, tvb, offset, len, ENC_NA);
+//     }
+//     offset +=len;
+
+//     /* padding */
+//     proto_tree_add_item(tree, hf_ssh_padding_string, tvb, offset, padding_length, ENC_NA);
+//     offset+= padding_length;
+
+//     return offset;
+// }
 
 static int ssh_dissect_kex_dh(guint8 msg_code, tvbuff_t *tvb,
         packet_info *pinfo, int offset, proto_tree *tree)
@@ -940,12 +1176,15 @@ ssh_dissect_kex_ecdh(guint8 msg_code, tvbuff_t *tvb,
 
 static int
 ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
-        struct ssh_peer_data *peer_data,
-        int offset, proto_tree *tree)
+        struct ssh_flow_data *global_data,
+        int offset, proto_tree *tree, int is_response,
+        gboolean *need_desegmentation)
 {
     gint len;
     guint plen;
+    struct ssh_peer_data *peer_data = &global_data->peer_data[is_response];
 
+    // Get the length of the entire SSH packet
     len = tvb_reported_length_remaining(tvb, offset);
     col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (len=%d)", len);
 
@@ -973,9 +1212,56 @@ ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
                 tvb, offset+4+encrypted_len,
                 peer_data->mac_length, ENC_NA);
     }
+
+    // If the packet can be decrypted
+    if(1/* Decryption Successful*/) {
+        proto_item *decrypted_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_decrypted, NULL, "Decrypted Packet");
+        ssh_dissect_decrypted_packet(tvb, pinfo, global_data, offset, decrypted_tree, is_response, need_desegmentation);
+    }
+
     offset+=len;
     return offset;
 }
+
+// static int
+// ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
+//         struct ssh_peer_data *peer_data,
+//         int offset, proto_tree *tree)
+// {
+//     gint len;
+//     guint plen;
+
+//     // Get the length of the entire SSH packet
+//     len = tvb_reported_length_remaining(tvb, offset);
+//     col_append_sep_fstr(pinfo->cinfo, COL_INFO, NULL, "Encrypted packet (len=%d)", len);
+
+//     if (tree) {
+//         gint encrypted_len = len;
+
+//         if (len > 4 && peer_data->length_is_plaintext) {
+//             plen = tvb_get_ntohl(tvb, offset) ;
+//             proto_tree_add_uint(tree, hf_ssh_packet_length, tvb, offset, 4, plen);
+//             encrypted_len -= 4;
+//         }
+//         else if (len > 4) {
+//             proto_tree_add_item(tree, hf_ssh_packet_length_encrypted, tvb, offset, 4, ENC_NA);
+//             encrypted_len -= 4;
+//         }
+
+//         if (peer_data->mac_length>0)
+//             encrypted_len -= peer_data->mac_length;
+
+//         proto_tree_add_item(tree, hf_ssh_encrypted_packet,
+//                     tvb, offset+4, encrypted_len, ENC_NA);
+
+//         if (peer_data->mac_length>0)
+//             proto_tree_add_item(tree, hf_ssh_mac_string,
+//                 tvb, offset+4+encrypted_len,
+//                 peer_data->mac_length, ENC_NA);
+//     }
+//     offset+=len;
+//     return offset;
+// }
 
 static int
 ssh_dissect_protocol(tvbuff_t *tvb, packet_info *pinfo,
@@ -991,8 +1277,9 @@ ssh_dissect_protocol(tvbuff_t *tvb, packet_info *pinfo,
      *  it is dump in the middle of a flow or not a ssh at all
      */
     if (tvb_strncaseeql(tvb, offset, "SSH-", 4) != 0) {
-        offset = ssh_dissect_encrypted_packet(tvb, pinfo,
-            &global_data->peer_data[is_response], offset, tree);
+        offset = ssh_dissect_encrypted_packet(tvb, pinfo, global_data,
+            offset, tree, is_response,
+            need_desegmentation);
         return offset;
     }
 
@@ -1581,7 +1868,8 @@ proto_register_ssh(void)
         &ett_key_exchange_host_key,
         &ett_ssh1,
         &ett_ssh2,
-        &ett_key_init
+        &ett_key_init,
+        &ett_decrypted
     };
 
     static ei_register_info ei[] = {
