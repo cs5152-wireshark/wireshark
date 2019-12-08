@@ -240,7 +240,7 @@ static dissector_handle_t ssh_handle;
 #define SSH_MSG_USERAUTH_SUCCESS    52
 #define SSH_MSG_USERAUTH_BANNER     53
 
-/* User authentication protocol: method specific (reusable) (50-79) */
+/* User authentication protocol: method specific (reusable) (60-79) */
 
 /* Connection protocol: generic (80-89) */
 #define SSH_MSG_GLOBAL_REQUEST          80
@@ -344,6 +344,7 @@ static int ssh_dissect_protocol(tvbuff_t *tvb, packet_info *pinfo,
         struct ssh_flow_data *global_data,
         int offset, proto_tree *tree, int is_response, guint *version,
         gboolean *need_desegmentation);
+
 static int ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
         struct ssh_flow_data *global_data,
         int offset, proto_tree *tree, int is_response,
