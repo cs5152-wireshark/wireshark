@@ -1062,8 +1062,8 @@ ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
                 peer_data->mac_length, ENC_NA);
     }
 
-    // TODO: confirm decryption success/failure
-    if(0/* Decryption Successful*/) {
+    // NULL ciphers can always be successfully decrypted.
+    if (g_strcmp0(peer_data->enc, "none") == 0) {
         proto_item *decrypted_tree = proto_tree_add_subtree(tree, tvb, offset, plen-1, ett_decrypted, NULL, "Decrypted Packet");
         ssh_dissect_decrypted_packet(tvb, pinfo, global_data, offset, decrypted_tree, is_response, need_desegmentation);
     }
