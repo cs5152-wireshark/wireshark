@@ -1037,7 +1037,7 @@ ssh_dissect_encrypted_packet(tvbuff_t *tvb, packet_info *pinfo,
     // Get the length of the entire SSH packet
     len = tvb_reported_length_remaining(tvb, offset);
 
-    if (tree) {
+    {
         gint encrypted_len = len;
 
         if (len > 4 && peer_data->length_is_plaintext) {
